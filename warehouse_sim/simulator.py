@@ -1,13 +1,17 @@
 """Tick-based fleet simulator: moves robots, checks collisions, injects blocked aisles."""
+import random
 from warehouse_sim.comms import LocalBus
 from warehouse_sim.robot import Robot
 from warehouse_sim.allocator import auction
 from warehouse_sim.planner import astar
 
 class Simulator:
-    def __init__(self, wmap, starts, tasks, policy="smart", block_event=None, max_ticks=600):
+    def __init__(self, wmap, starts, tasks, policy="smart", block_event=None,
+                 max_ticks=600, drop_rate=0.0, delay_ticks=0, dead_zones=(),
+                 channel_seed=None, spawn_rate=0.0, max_tasks=None):
         self.wmap = wmap
-        self.bus = LocalBus()
+        self.bus = LocalBus(drop_rate=drop_rate, delay_ticks=delay_ticks,
+                            dead_zones=dead_zones, seed=channel_seed)
         self.robots = [Robot(rid=i, start=s, wmap=wmap, bus=self.bus, policy=policy)
                        for i, s in enumerate(starts)]
         self.tasks = tasks  # list of {id, pickup, drop, urgency, assigned, done}
@@ -15,6 +19,7 @@ class Simulator:
         self.max_ticks = max_ticks
         self.tick = 0
         self.collisions = 0
+        self.deaths = 0
         self.reroutes = 0       # contention/blockage replans (dashboard KPI)
         self.deadlocks = 0      # distinct wait-for cycle episodes (dashboard KPI)
         self.recoveries = 0     # pull-over recoveries executed
@@ -24,6 +29,13 @@ class Simulator:
         self._prev_positions = {}  # positions at end of last tick (stall check)
         self.events = []        # (tick, text, kind) feed for the dashboard
         self.history = []  # per-tick positions for replay
+        # continuous task arrivals (Poisson-ish): quota incl. initial tasks
+        self.spawn_rate = spawn_rate
+        self.max_tasks = max_tasks
+        self.spawn_cap = 7  # max concurrent open tasks
+        self.spawned = len(tasks)
+        self._spawn_rng = random.Random(channel_seed)
+        self.telemetry = {"tick": [], "done": [], "avg_batt": []}
         self._initial_assign()
 
     def _initial_assign(self):
@@ -66,10 +78,16 @@ class Simulator:
             for r in self.robots:
                 if r.goal is not None and (r.pos in cells or any(c in r.path for c in cells)):
                     r.plan()
-        # 2. comms phase: broadcast intents, then receive
+        # 2. comms phase: broadcast intents, pump the channel, then receive
+        # (dry robots are silent wrecks)
         for r in self.robots:
+            if r.dead:
+                continue
             r.broadcast_state()
+        self.bus.pump(self.tick, {r.rid: r.pos for r in self.robots})
         for r in self.robots:
+            if r.dead:
+                continue
             r.drain_inbox()
         # 2b. battery phase.
         # - robots on the dock charge to full, then resume saved work.
@@ -78,10 +96,15 @@ class Simulator:
         #   busy, in which case non-critical robots defer and KEEP WORKING.
         from warehouse_sim.robot import (LOW_BATTERY, CRITICAL_BATTERY,
                                          RESUME_CHARGE, CHARGE_RATE)
-        dock = self.wmap.dock
+        docks = self.wmap.docks
         resumes = 0
+        # the dry: 0% battery robots freeze as obstacles, task re-queued
+        # with the package dropped where they died
         for r in self.robots:
-            if r.charging and r.pos == dock:
+            if not r.dead and not r.charging and r.battery <= 0:
+                self.kill_robot(r)
+        for r in self.robots:
+            if r.charging and r.pos in docks:
                 r.battery = min(100.0, r.battery + CHARGE_RATE)
                 if r.battery >= r.charge_target:
                     r.finish_charging()
@@ -89,11 +112,13 @@ class Simulator:
         needy = sorted((r for r in self.robots
                         if not r.charging and r.battery < LOW_BATTERY),
                        key=lambda r: r.battery)
-        # dock exclusion zone: while anyone is charging, idle robots keep
-        # off the dock AND its neighboring cells (a squatter one step away
-        # pins chargers just as hard — recoveries alone never converge).
-        dock_zone = {dock, (dock[0] - 1, dock[1]), (dock[0] + 1, dock[1]),
-                     (dock[0], dock[1] - 1), (dock[0], dock[1] + 1)}
+        # dock exclusion zone (ALL docks + neighbors): while anyone is
+        # charging, idle robots keep off (a squatter one step away pins
+        # chargers just as hard — recoveries alone never converge).
+        dock_zone = set()
+        for dk in docks:
+            dock_zone |= {dk, (dk[0] - 1, dk[1]), (dk[0] + 1, dk[1]),
+                          (dk[0], dk[1] - 1), (dk[0], dk[1] + 1)}
         dock_zone = {c for c in dock_zone
                      if 0 <= c[0] < self.wmap.width and 0 <= c[1] < self.wmap.height
                      and self.wmap.grid[c[1]][c[0]] == 0}
@@ -121,7 +146,8 @@ class Simulator:
             if r.task_id is not None and r.phase == "pickup":
                 to_pick = r.leg_cost(r.pos, r.pickup)
                 to_drop = r.leg_cost(r.pickup, r.drop)
-                to_dock = r.leg_cost(r.pickup, dock)
+                to_dock = min([r.leg_cost(r.pickup, d) for d in docks],
+                              default=float("inf"))
                 if r.battery >= to_pick + to_drop:
                     continue  # D1: finishes pickup + delivery, no trip
                 if (not r.topup_after_pickup
@@ -136,12 +162,17 @@ class Simulator:
                 # carrying: finish if the drop leg fits, else dock with it
                 if r.battery >= r.leg_cost(r.pos, r.drop):
                     continue
-            dock_busy = any(q.charging for q in self.robots if q is not r)
-            if dock_busy and r.battery >= CRITICAL_BATTERY:
-                if not r.queued_charge:
-                    r.queued_charge = True
-                    r.log.append(f"R{r.rid} dock busy ({r.battery:.0f}%) -> working on")
-                continue
+            trip, _dist = self._claim_dock(r)
+            if trip is None:
+                if r.battery >= CRITICAL_BATTERY:
+                    if not r.queued_charge:
+                        r.queued_charge = True
+                        r.log.append(
+                            f"R{r.rid} docks busy ({r.battery:.0f}%) -> working on")
+                    continue
+                trip, _dist = self._claim_dock(r, allow_busy=True)
+                if trip is None:
+                    continue  # no dock reachable: keep working, retry later
             r.queued_charge = False
             if r.task_id is not None and r.phase == "pickup":
                 # safety: never dock holding an unstarted task
@@ -153,13 +184,13 @@ class Simulator:
                 r.log.append(f"R{r.rid} low battery -> released T{tid} to pool")
                 target = 100.0
             else:
-                # charge to whatever the remaining job needs from the dock
+                # charge to whatever the remaining job needs from THIS dock
                 goal = r.drop if r.phase == "drop" else None
-                legs = ([(dock, goal)] if goal is not None
-                        else [(dock, r.pickup), (r.pickup, r.drop)]
+                legs = ([(trip, goal)] if goal is not None
+                        else [(trip, r.pickup), (r.pickup, r.drop)]
                         if r.pickup is not None else [])
                 target = r.charge_needed(legs) if legs else 100.0
-            r.start_charging_trip(dock, target)
+            r.start_charging_trip(trip, target)
         # 3. decide moves (decentralized — each robot decides locally)
         # Priority-ordered execution emulates the converged P2P reservation:
         # all robots share the same intent view + same priority rule, so all
@@ -331,7 +362,7 @@ class Simulator:
             # lowest-priority-first, on-dock chargers last. Entombed members
             # are skipped via the walls check below.
             def pull_rank(r):
-                if r.charging and r.pos != self.wmap.dock:
+                if r.charging and r.pos not in self.wmap.docks:
                     group = 0
                 elif not r.charging:
                     group = 1
@@ -339,7 +370,7 @@ class Simulator:
                     group = 2
                 return (group, tuple(-v for v in r.priority()))
             members.sort(key=pull_rank)
-            forbid = {self.wmap.dock}
+            forbid = set(self.wmap.docks)
             forbid |= {p for t in self.tasks for p in (t["pickup"], t["drop"])}
             forbid |= {c for q in self.robots for c in q.path}
             for m in members:
@@ -396,8 +427,15 @@ class Simulator:
                             t["carrier"] = r.rid
                     if r.topup_after_pickup:
                         r.topup_after_pickup = False
-                        target = r.charge_needed([(dock, r.drop)])
-                        r.start_charging_trip(dock, target)
+                        td, _d = self._claim_dock(r, allow_busy=True)
+                        if td is None:  # docks unreachable: closest by air
+                            td = min(self.wmap.docks,
+                                     key=lambda d: abs(d[0] - r.pos[0])
+                                     + abs(d[1] - r.pos[1]))
+                            target = 100.0
+                        else:
+                            target = r.charge_needed([(td, r.drop)])
+                        r.start_charging_trip(td, target)
                         r.log.append(f"R{r.rid} topped up to {target:.0f}% "
                                      f"for T{r.task_id} delivery")
                     else:
@@ -412,8 +450,13 @@ class Simulator:
                     r.path = []
                     r.task_urgency = 999  # idle: lowest priority, vacates for active robots
         assigns = self._assign_remaining()
+        self._maybe_spawn()
         self.history.append({r.rid: r.pos for r in self.robots})
         self._prev_positions = {r.rid: r.pos for r in self.robots}
+        self.telemetry["tick"].append(self.tick)
+        self.telemetry["done"].append(sum(1 for t in self.tasks if t.get("done")))
+        self.telemetry["avg_batt"].append(
+            round(sum(r.battery for r in self.robots) / max(len(self.robots), 1), 1))
         self.tick += 1
         # contention/blockage replans = all replans minus fresh task
         # assignments and charge-resume plans (those are routine, not reroutes)
@@ -472,6 +515,47 @@ class Simulator:
                 r.pull_cell, r.pull_goal, r.pull_calm = None, None, 0
                 r.log.append(f"R{r.rid} pull-over done -> resume {r.goal}")
 
+    def kill_robot(self, r):
+        """0% battery: freeze in place as an obstacle; re-queue its task
+        with the package dropped where it died."""
+        r.dead = True
+        r.charging = False
+        r.queued_charge = False
+        r.saved_task = None
+        self.deaths += 1
+        if r.task_id is not None:
+            for t in self.tasks:
+                if t["id"] == r.task_id and not t.get("done"):
+                    t["assigned"] = None
+                    t["pickup"] = r.pos
+                    t["picked"] = False
+                    t["carrier"] = None
+        r.clear_task()
+        r.log.append(f"R{r.rid} DIED at {r.pos} (0%) -> task re-queued")
+        self.events.append((self.tick, f"R{r.rid} ran dry at {r.pos}", "alert"))
+
+    def _claim_dock(self, r, allow_busy=False):
+        """Nearest reachable dock, skipping ones reserved/held by other
+        charging robots (unless allow_busy for critical batteries).
+        Returns (dock, dist_cells) or (None, inf)."""
+        busy = set()
+        if not allow_busy:
+            for q in self.robots:
+                if q is r or not q.charging:
+                    continue
+                if q.dock_target is not None:
+                    busy.add(tuple(q.dock_target))
+                if q.pos in self.wmap.docks:
+                    busy.add(tuple(q.pos))
+        best, best_d = None, float("inf")
+        for d in self.wmap.docks:
+            if d in busy:
+                continue
+            p = astar(r.pos, d, r.wmap, blocked=r.blocked_known)
+            if p and len(p) - 1 < best_d:
+                best, best_d = d, len(p) - 1
+        return best, best_d
+
     def _escape_cell(self, robot, claimed):
         """Find a free neighbor for a robot forced to vacate its cell."""
         occupied = {r.pos for r in self.robots}
@@ -485,13 +569,61 @@ class Simulator:
         return None
 
     def all_done(self):
+        if self.max_tasks is not None and self.spawned < self.max_tasks:
+            return False
         return all(t.get("done") for t in self.tasks)
+
+    def _sample_pair(self):
+        """Random reachable pickup->drop pair avoiding robots, tasks, docks,
+        future blockages. Reachability is tested from CURRENT robot cells
+        UNDER ALL scheduled obstacle events, so the task can never be born
+        already stranded by a later spawn. None when nothing suitable found."""
+        future_blocks = set()
+        for cells in self.block_event.values():
+            future_blocks |= set(cells)
+        free = [(x, y) for y in range(self.wmap.height)
+                for x in range(self.wmap.width) if self.wmap.grid[y][x] == 0]
+        avoid = {r.pos for r in self.robots} | set(self.wmap.docks)
+        avoid |= {p for t in self.tasks for p in (t["pickup"], t["drop"])}
+        avoid |= future_blocks
+        cands = [c for c in free if c not in avoid]
+        self._spawn_rng.shuffle(cands)
+        here = [r.pos for r in self.robots]
+        for p in cands[:40]:
+            drops = [c for c in cands if c != p]
+            self._spawn_rng.shuffle(drops)
+            for d in drops[:12]:
+                if (any(astar(s, p, self.wmap, blocked=future_blocks)
+                        for s in here)
+                        and astar(p, d, self.wmap, blocked=future_blocks)):
+                    return p, d
+        return None
+
+    def _maybe_spawn(self):
+        if self.spawn_rate <= 0 or self.spawned >= (self.max_tasks or 0):
+            return
+        if sum(1 for t in self.tasks if not t.get("done")) >= self.spawn_cap:
+            return
+        if self._spawn_rng.random() >= self.spawn_rate:
+            return
+        pair = self._sample_pair()
+        if pair is None:
+            return
+        p, d = pair
+        tid = max([t["id"] for t in self.tasks], default=-1) + 1
+        urg = max([t.get("urgency", 0) for t in self.tasks], default=-1) + 1
+        self.tasks.append({"id": tid, "pickup": p, "drop": d, "urgency": urg,
+                           "assigned": None, "done": False,
+                           "picked": False, "carrier": None})
+        self.spawned += 1
+        self.events.append((self.tick, f"New task T{tid} P{p} -> D{d}", "info"))
 
     def run(self, verbose=False):
         while self.tick < self.max_ticks and not self.all_done():
             self.step()
         makespan = self.tick
         waits = {r.rid: r.waited_total for r in self.robots}
+        done = sum(1 for t in self.tasks if t.get("done"))
         if verbose:
             print(f"policy={self.robots[0].policy} makespan={makespan} "
                   f"collisions={self.collisions} waits={waits}")
@@ -499,22 +631,29 @@ class Simulator:
                 "waits": waits, "ticks": self.tick,
                 "reroutes": self.reroutes, "deadlocks": self.deadlocks,
                 "recoveries": self.recoveries,
+                "deaths": self.deaths,
+                "deliveries": done,
+                "throughput": round(done / max(makespan, 1), 4),
+                "comm_dropped": self.bus.dropped,
+                "policy": self.robots[0].policy if self.robots else "?",
                 "replans": {r.rid: r.replans for r in self.robots}}
 
 
-def _check_disjoint(starts, pairs, dock, where):
-    """Guarantee robots never spawn on pickups/drops/dock and no two
+def _check_disjoint(starts, pairs, docks, where):
+    """Guarantee robots never spawn on pickups/drops/docks and no two
     markers share a cell. Raises loudly instead of shipping a bad map."""
-    starts, dock = set(starts), tuple(dock)
+    starts = set(starts)
+    docks = {tuple(d) for d in docks}
     seen = {}
     problems = []
-    if dock in starts:
-        problems.append(f"dock {dock} under a robot start")
+    if docks & starts:
+        problems.append(f"dock {docks & starts} under a robot start")
     for tid, (p, d) in enumerate(pairs):
         for cell, kind in ((p, "pickup"), (d, "drop")):
             if cell in starts:
                 problems.append(f"T{tid} {kind} {cell} under a robot start")
-            if cell == dock:
+            if cell in docks:
+                problems.append(f"T{tid} {kind} {cell} on a dock")
                 problems.append(f"T{tid} {kind} {cell} on the dock")
             if cell in seen:
                 problems.append(f"T{tid} {kind} {cell} stacks on {seen[cell]}")
@@ -530,12 +669,12 @@ def make_fixed_scenario(policy="smart"):
     Each task = pickup (red) -> drop-off (green); pairs span the map so
     routes cross at the center choke.
     """
-    from warehouse_sim.config import build_default_map
+    from warehouse_sim.config import build_default_map, DEAD_ZONES
     wmap = build_default_map()
-    starts = [(1, 1), (26, 1), (1, 16)]
+    starts = [(1, 1), (26, 1), (1, 14)]
     pairs = [((2, 2), (25, 15)), ((2, 15), (25, 2)), ((25, 5), (2, 14)),
              ((9, 1), (14, 16)), ((2, 8), (25, 11))]
-    _check_disjoint(starts, pairs, wmap.dock, "fixed")
+    _check_disjoint(starts, pairs, wmap.docks, "fixed")
     tasks = [
         {"id": i, "pickup": p, "drop": d, "urgency": i, "assigned": None, "done": False, "picked": False, "carrier": None}
         for i, (p, d) in enumerate(pairs)
@@ -547,7 +686,9 @@ def make_fixed_scenario(policy="smart"):
         55: [(15, 5), (16, 5)],
         75: [(7, 14), (8, 14)],
     }
-    sim = Simulator(wmap, starts, tasks, policy=policy, block_event=block_event)
+    sim = Simulator(wmap, starts, tasks, policy=policy, block_event=block_event,
+                    drop_rate=0.03, delay_ticks=1, dead_zones=DEAD_ZONES,
+                    channel_seed=1234)
     # demo: R2 starts low so it must dock mid-run
     for r, b in zip(sim.robots, (100.0, 100.0, 35.0)):
         r.battery = b
@@ -564,7 +705,7 @@ def make_scenario(policy="smart", seed=None, n_tasks=5):
             if wmap.grid[y][x] == 0]
     # blocked aisle cells (mid-run event) — keep goals/starts clear of these
     blocked_cells = {(5, y) for y in range(1, wmap.height - 1) if y != 8}  # gap at y=8: detour stays open
-    usable = [c for c in free if c not in blocked_cells and c != wmap.dock]
+    usable = [c for c in free if c not in blocked_cells and c not in wmap.docks]
     # Random every run, but biased so paths overlap through the center choke
     # (else random maps often have zero contention and prove nothing).
     # 70%: pickups on one side, drop-offs on the opposite side -> forced crossing.
@@ -588,7 +729,7 @@ def make_scenario(policy="smart", seed=None, n_tasks=5):
         rng.shuffle(drop_pool)
         # used = every taken cell: starts, dock, chosen pickups AND drops —
         # no robot spawns on a marker, no two markers stack.
-        used = set(starts) | {wmap.dock}
+        used = set(starts) | set(wmap.docks)
         for p in pick_pool:
             if len(pairs) >= n_tasks:
                 break
@@ -607,7 +748,7 @@ def make_scenario(policy="smart", seed=None, n_tasks=5):
         # fallback: fully random reachable pickup->drop pairs
         starts = rng.sample(usable, 3)
         pairs = []
-        used = set(starts) | {wmap.dock}
+        used = set(starts) | set(wmap.docks)
         cands = [c for c in usable if c not in starts]
         rng.shuffle(cands)
         for p in cands:
@@ -626,7 +767,7 @@ def make_scenario(policy="smart", seed=None, n_tasks=5):
                     pairs.append((p, d))
                     used |= {p, d}
                     break
-    _check_disjoint(starts, pairs, wmap.dock, "random")
+    _check_disjoint(starts, pairs, wmap.docks, "random")
     tasks = [
         {"id": i, "pickup": p, "drop": d, "urgency": i, "assigned": None, "done": False, "picked": False, "carrier": None}
         for i, (p, d) in enumerate(pairs)
@@ -634,7 +775,7 @@ def make_scenario(policy="smart", seed=None, n_tasks=5):
     # Dynamic obstacle spawns (spill / fallen pallet): small 2-3 cell patches
     # popping up mid-run at random free cells, away from tasks/dock/starts
     # and never in the 1-wide choke (a patch there would seal the map).
-    task_cells = set(starts) | {wmap.dock} | set(blocked_cells)
+    task_cells = set(starts) | set(wmap.docks) | set(blocked_cells)
     for p, d in pairs:
         task_cells |= {p, d}
     choke = set(wmap.choke_cells or [])
@@ -663,7 +804,8 @@ def make_scenario(policy="smart", seed=None, n_tasks=5):
             trial = set(blocked_cells) | {x for v in spawns.values() for x in v} | set(patch)
             keep = True
             for s in starts:
-                for cell in [p for pair in pairs for p in pair] + [wmap.dock]:
+                for cell in ([p for pair in pairs for p in pair]
+                             + list(wmap.docks)):
                     if not astar(s, cell, wmap, blocked=trial):
                         keep = False
                         break
@@ -676,7 +818,11 @@ def make_scenario(policy="smart", seed=None, n_tasks=5):
     # blocked aisle mid-run (t=40) + sudden obstacle spawns (t=70, t=120)
     block_event = {40: sorted(blocked_cells)}
     block_event.update(spawns)
-    sim = Simulator(wmap, starts, tasks, policy=policy, block_event=block_event)
+    from warehouse_sim.config import DEAD_ZONES
+    sim = Simulator(wmap, starts, tasks, policy=policy, block_event=block_event,
+                    max_ticks=900, drop_rate=0.03, delay_ticks=1,
+                    dead_zones=DEAD_ZONES, channel_seed=seed,
+                    spawn_rate=0.04, max_tasks=n_tasks + 7)
     # random starting charge so docking trips happen on some runs
     for r in sim.robots:
         r.battery = round(rng.uniform(50.0, 100.0), 1)

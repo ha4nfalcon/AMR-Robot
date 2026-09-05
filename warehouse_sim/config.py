@@ -11,6 +11,9 @@ FIXED_OBSTACLES = [
     (11, 11), (12, 11),                      # pallet stack in cross-aisle
 ]
 
+# Wi-Fi dead zones (inclusive rects): radios inside go deaf (see comms.py)
+DEAD_ZONES = [(11, 1, 13, 3), (20, 13, 22, 15)]
+
 @dataclass
 class WarehouseMap:
     width: int = 28
@@ -19,7 +22,8 @@ class WarehouseMap:
     choke_cells: list = None  # narrow intersection cells
     pickup_points: list = None
     dropoff_points: list = None
-    dock: tuple = (26, 16)  # single charging dock
+    dock: tuple = (26, 16)  # primary charging dock (compat)
+    docks: list = None       # all charging docks
 
     def is_free(self, x, y, blocked=None):
         if not (0 <= x < self.width and 0 <= y < self.height):
@@ -75,10 +79,12 @@ def build_default_map() -> WarehouseMap:
         grid[y][x] = FREE
 
     dock = (26, 16)
-    grid[dock[1]][dock[0]] = FREE  # charging dock always clear
+    docks = [(26, 16), (1, 16)]
+    for _d in docks:
+        grid[_d[1]][_d[0]] = FREE  # charging docks always clear
 
     return WarehouseMap(width=W, height=H, grid=grid,
                          choke_cells=choke_cells,
                          pickup_points=pickup_points,
                          dropoff_points=dropoff_points,
-                         dock=dock)
+                         dock=dock, docks=docks)

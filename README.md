@@ -9,33 +9,39 @@ fallen-pallet patches that spawn mid-run keep every run dynamic.
 1. **Decentralized Communication** — `warehouse_sim/comms.py`: `LocalBus` (sim)
    + `UdpPeer` (real UDP broadcast sockets for Pi/Jetson LAN, JSON <1KB, 5–10Hz).
    Robots share `STATE {pos, intent[3], priority, battery, task}` + `BLOCKED` alerts.
-2. **Dynamic Conflict Resolution** — `robot.py` + `simulator.py`: space-time intent
-   reservation, priority `(urgency, battery, id)`, yield-or-reroute after 4 waits,
-   head-on deadlock vacate (sidestep / revert). Zero collisions verified.
+   The sim channel is realistic: per-message loss, delivery delay, and Wi-Fi
+   dead zones (see `DEAD_ZONES`); drops are counted (`comm_dropped` metric).
+2. **Dynamic Conflict Resolution** — `robot.py` + `simulator.py`: time-window
+   intent reservations (ETA-matched cells), priority `(urgency, battery, id)`,
+   yield-or-reroute after 4 waits, head-on deadlock vacate (sidestep / revert),
+   pull-over recovery with stall-set tracking. Zero collisions verified.
 3. **Task Allocation & Re-routing** — `allocator.py`: decentralized single-round
-   auction (bid = A* length + battery penalty); auto re-plan + re-auction on
-   blocked-aisle broadcast.
+   auction (nearest-pickup greedy matching + low-battery dock-detour factor);
+   auto re-plan + re-auction on blocked-aisle broadcast. Tasks arrive
+   continuously (Poisson spawner); headline metric is throughput (tasks/tick).
 - **Multi-Agent Path Planning (edge)** — `planner.py`: heapq A*, Manhattan,
-  <1ms replan on 20×14 grid, extra-cost penalties for contested cells.
-- **Fleet Dashboard** — `dashboard.py`: dark ops-console UI (stdlib Tkinter).
-  KPI cards (mode / steps / tasks / collisions / replans-deadlocks), live map,
-  fleet cards with battery bars + status pills, task board, visual legend,
-  color-coded event feed. Controls: RUN / STEP / RESET / speed.
-- **Charging dock** — `config.py` dock; task assignment is pure nearest
-  pickup regardless of charge. Below 25% a robot trips to the dock with its
-  task stashed (carriers keep the package — dock arrival never counts as
-  delivery) and resumes at a full green 100%. One charges at a time;
-  non-critical robots defer and keep working; idle robots keep clear of
-  the dock zone while anyone charges; persistent stalls trigger pull-over
-  recovery with stall-set tracking.
+  <1ms replan on 28×18 grid, extra-cost penalties for contested cells.
+- **Fleet Dashboard** — `dashboard.py` (stdlib Tkinter) or `dashboard_ctk.py`
+  (`--ui ctk`, customtkinter): KPI cards, live map, fleet cards with battery
+  bars + status pills, task board, visual legend, color-coded event feed,
+  live telemetry strip (deliveries + fleet battery). Controls: RUN / STEP /
+  RESET / speed / LIGHT-DARK toggle.
+- **Charging docks (x2)** — `config.py` docks with per-dock reservations;
+  task assignment is pure nearest pickup regardless of charge. Below 25% a
+  robot trips to the nearest free dock with its task stashed (carriers keep
+  the package — dock arrival never counts as delivery) and resumes at a
+  computed charge target. One robot per dock; non-critical robots defer and
+  keep working; idle robots keep clear of dock zones. Load-scaled drain
+  (0.6 empty / 1.0 loaded); 0% robots die in place and their task re-queues.
 
 ## Run
 ```bash
-pip install -r requirements.txt   # only for optional plots; sim is stdlib-only
+pip install -r requirements.txt   # sim is stdlib-only; ctk UI needs customtkinter
 python benchmark.py               # success-criteria check (smart vs stop-and-wait)
-python main.py --policy smart             # live dashboard
+python benchmark.py --seeds 20 --csv results.csv   # batch + 95% CI table
+python main.py --policy smart             # live dashboard (Tkinter)
+python main.py --policy smart --ui ctk    # modern dashboard (customtkinter)
 python main.py --policy smart --headless  # no UI (edge / CI)
-python main.py --policy stopwait --headless
 ```
 
 ## Result (overlapping-paths scenario, 3 AMRs, 5 pickup→drop tasks, blocked aisle + mid-run spawns)

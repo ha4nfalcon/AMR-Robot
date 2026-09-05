@@ -70,10 +70,12 @@ BODY_FONT = ("Segoe UI", 9)
 MONO_FONT = ("Consolas", 9)
 
 
-def robot_status(r, dock):
+def robot_status(r, docks):
     """Status pill for a robot -> (label, color). Pure: unit-testable."""
+    if getattr(r, "dead", False):
+        return ("DEAD", "red")
     if r.charging:
-        return ("CHARGING", "cyan") if r.pos == dock else ("TO DOCK", "cyan")
+        return ("CHARGING", "cyan") if r.pos in docks else ("TO DOCK", "cyan")
     if getattr(r, "no_route", False) and r.task_id is not None:
         return ("NO ROUTE", "red")
     if getattr(r, "queued_charge", False):
@@ -90,7 +92,7 @@ def robot_status(r, dock):
 def log_tag(line):
     """Event-feed color tag for a log line. Pure: unit-testable."""
     u = line.upper()
-    if "DEADLOCK" in u or "EMERGENCY" in u or "FAILED" in u:
+    if "DEADLOCK" in u or "EMERGENCY" in u or "FAILED" in u or "DIED" in u:
         return "alert"
     if "NO ROUTE" in u or "BLACKOUT" in u:
         return "warn"
@@ -287,12 +289,12 @@ class Dashboard:
                     fill = CHOKE
                 cv.create_rectangle(x * c, y * c, (x + 1) * c, (y + 1) * c,
                                     fill=fill, outline=GRID_LINE, tags=("static",))
-        dx0, dy0 = m.dock
-        cv.create_rectangle(dx0 * c + 2, dy0 * c + 2, (dx0 + 1) * c - 2, (dy0 + 1) * c - 2,
-                            fill=ACC, outline=ROBOT_EDGE, width=1, tags=("static",))
-        cv.create_text(dx0 * c + c / 2, dy0 * c + c / 2, text="CHG",
-                       fill="#04121a" if self.theme == "dark" else "white",
-                       font=("Consolas", 8, "bold"), tags=("static",))
+        for dx0, dy0 in m.docks:
+            cv.create_rectangle(dx0 * c + 2, dy0 * c + 2, (dx0 + 1) * c - 2, (dy0 + 1) * c - 2,
+                                fill=ACC, outline=ROBOT_EDGE, width=1, tags=("static",))
+            cv.create_text(dx0 * c + c / 2, dy0 * c + c / 2, text="CHG",
+                           fill="#04121a" if self.theme == "dark" else "white",
+                           font=("Consolas", 8, "bold"), tags=("static",))
 
     def _draw_dynamic(self):
         """Only ~20 moving items are redrawn per tick (tagged 'dyn')."""
@@ -383,7 +385,7 @@ class Dashboard:
     def _update_fleet(self):
         m = self.sim.wmap
         for r, refs in zip(self.sim.robots, self._fleet_refs):
-            label, key = robot_status(r, m.dock)
+            label, key = robot_status(r, m.docks)
             refs["pill"].config(text=label, fg=PILL_FG[key], bg=PILL_BG[key])
             w = 110 * max(0.0, min(1.0, r.battery / 100.0))
             refs["bar"].coords(refs["rect"], 0, 0, w, 10)

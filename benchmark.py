@@ -4,36 +4,99 @@ A) Fixed overlapping-paths stress scenario (deterministic success-criteria proof
 B) Mean over N_SEEDS random scenarios (robustness; random maps often have
    little contention, so per-seed reduction varies — expected).
 Success criteria: zero collisions + >=20% makespan reduction on overlapping paths.
+
+Batch mode: --seeds N --csv results.csv runs N random seeds per policy,
+writes one metrics row per run, and reports mean +/- 95% CI.
 """
+import argparse
+import csv
 import random
+import statistics
 from warehouse_sim.simulator import make_fixed_scenario, make_scenario
 
 N_SEEDS = 5
+METRICS = ["makespan", "collisions", "deliveries", "throughput",
+           "reroutes", "deadlocks", "recoveries", "deaths", "comm_dropped"]
+
 
 def run_fixed(policy):
     return make_fixed_scenario(policy=policy).run()
 
+
 def run_random(policy, seed):
     return make_scenario(policy=policy, seed=seed).run()
 
-if __name__ == "__main__":
-    smart = run_fixed("smart")
-    base = run_fixed("stopwait")
-    red = 100 * (base["makespan"] - smart["makespan"]) / max(base["makespan"], 1)
-    cap = " [STOPWAIT DEADLOCKED at 600-tick cap]" if base["makespan"] >= 600 else ""
-    print(f"FIXED overlapping: SMART makespan={smart['makespan']} coll={smart['collisions']} | "
-          f"STOPWAIT makespan={base['makespan']} coll={base['collisions']} | reduction={red:.1f}%{cap}")
-    ok_fixed = smart["collisions"] == 0 and red >= 20.0
-    print("FIXED: " + ("PASS" if ok_fixed else "FAIL"))
 
-    seeds = [random.randint(0, 10**6) for _ in range(N_SEEDS)]
-    reds, scoll = [], 0
+def mean_ci(xs):
+    """Mean +/- 95% confidence interval (normal approx)."""
+    if not xs:
+        return 0.0, 0.0
+    m = statistics.fmean(xs)
+    if len(xs) < 2:
+        return m, 0.0
+    ci = 1.96 * statistics.stdev(xs) / (len(xs) ** 0.5)
+    return m, ci
+
+
+def batch(n_seeds, csv_path, base_seed=0):
+    rng = random.Random(base_seed)
+    seeds = [rng.randint(0, 10**6) for _ in range(n_seeds)]
+    rows = []
     for s in seeds:
-        a = run_random("smart", s)
-        b = run_random("stopwait", s)
-        r = 100 * (b["makespan"] - a["makespan"]) / max(b["makespan"], 1)
-        reds.append(r)
-        scoll += a["collisions"]
-        print(f"seed={s} SMART={a['makespan']}/{a['collisions']} STOPWAIT={b['makespan']}/{b['collisions']} red={r:.1f}%")
-    print(f"Random mean reduction: {sum(reds)/len(reds):.1f}%, SMART collisions: {scoll}")
-    print("OVERALL: " + ("PASS" if (ok_fixed and scoll == 0) else "FAIL"))
+        for policy in ("smart", "stopwait"):
+            r = run_random(policy, s)
+            rows.append({"seed": s, "policy": policy,
+                         **{k: r.get(k, "") for k in METRICS}})
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["seed", "policy"] + METRICS)
+        w.writeheader()
+        w.writerows(rows)
+    print(f"wrote {len(rows)} rows -> {csv_path}")
+    for metric in METRICS:
+        a = [r[metric] for r in rows if r["policy"] == "smart"]
+        b = [r[metric] for r in rows if r["policy"] == "stopwait"]
+        ma, ca = mean_ci(a)
+        mb, cb = mean_ci(b)
+        print(f"{metric:12s} smart {ma:9.2f} +/- {ca:6.2f} | "
+              f"stopwait {mb:9.2f} +/- {cb:6.2f}")
+    reds = [100 * (b["makespan"] - a["makespan"]) / max(b["makespan"], 1)
+            for a, b in zip([r for r in rows if r["policy"] == "smart"],
+                            [r for r in rows if r["policy"] == "stopwait"])]
+    mr, cr = mean_ci(reds)
+    print(f"makespan reduction: {mr:.1f}% +/- {cr:.1f}% (n={n_seeds})")
+    scoll = sum(r["collisions"] for r in rows if r["policy"] == "smart")
+    print("OVERALL: " + ("PASS" if scoll == 0 else "FAIL")
+          + f" (smart collisions: {scoll})")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--seeds", type=int, default=0,
+                    help="batch mode: random seeds per policy")
+    ap.add_argument("--csv", default="results.csv",
+                    help="batch mode output path")
+    ap.add_argument("--base-seed", type=int, default=0)
+    args = ap.parse_args()
+    if args.seeds > 0:
+        batch(args.seeds, args.csv, args.base_seed)
+    else:
+        smart = run_fixed("smart")
+        base = run_fixed("stopwait")
+        red = 100 * (base["makespan"] - smart["makespan"]) / max(base["makespan"], 1)
+        cap = " [STOPWAIT DEADLOCKED at 600-tick cap]" if base["makespan"] >= 600 else ""
+        print(f"FIXED overlapping: SMART makespan={smart['makespan']} coll={smart['collisions']} | "
+              f"STOPWAIT makespan={base['makespan']} coll={base['collisions']} | reduction={red:.1f}%{cap}")
+        ok_fixed = smart["collisions"] == 0 and red >= 20.0
+        print("FIXED: " + ("PASS" if ok_fixed else "FAIL"))
+
+        seeds = [random.randint(0, 10**6) for _ in range(N_SEEDS)]
+        reds, scoll = [], 0
+        for s in seeds:
+            a = run_random("smart", s)
+            b = run_random("stopwait", s)
+            r = 100 * (b["makespan"] - a["makespan"]) / max(b["makespan"], 1)
+            reds.append(r)
+            scoll += a["collisions"]
+            print(f"seed={s} SMART={a['makespan']}/{a['collisions']} STOPWAIT={b['makespan']}/{b['collisions']} red={r:.1f}%")
+        print(f"Random mean reduction: {sum(reds)/len(reds):.1f}%, SMART collisions: {scoll}")
+        print("OVERALL: " + ("PASS" if (ok_fixed and scoll == 0) else "FAIL"))

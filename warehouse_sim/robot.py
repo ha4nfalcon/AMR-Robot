@@ -26,7 +26,9 @@ LOW_BATTERY = 25.0    # below this -> run the energy planner (trip / top-up?)
 CRITICAL_BATTERY = 10.0  # below this -> charge even if the dock is busy
 RESUME_CHARGE = 100.0  # default charge target (full green bar)
 CHARGE_RATE = 5.0     # battery points per tick on the dock (~3s for full charge)
-DRAIN_PER_MOVE = 0.8  # battery usage per unit distance (per grid cell)
+DRAIN_PER_MOVE = 0.8  # average battery usage per grid cell (estimates)
+EMPTY_DRAIN = 0.6     # per-cell drain driving empty
+LOADED_DRAIN = 1.0    # per-cell drain carrying a package
 ENERGY_MARGIN = 1.5   # safety factor on movement estimates (detours/contention)
 CHARGE_BUFFER = 5.0   # extra points on top of a computed charge target
 
@@ -47,7 +49,9 @@ class Robot:
     task_id: int = None
     task_urgency: int = 999
     battery: float = 100.0
+    dead: bool = False          # True after running dry: frozen wreck
     charging: bool = False      # True while heading to / sitting on dock
+    dock_target: object = None  # reserved dock cell while charging
     saved_task: object = None   # stashed (task_id, pickup, drop, phase, urgency)
     queued_charge: bool = False  # True while deferring trip (dock busy, keep working)
     topup_after_pickup: bool = False  # fetch first, then dock for a top-up
@@ -116,7 +120,7 @@ class Robot:
             "priority": self.priority(), "task": self.task_id,
             "battery": round(self.battery, 1),
         })
-        self.bus.broadcast(m)
+        self.bus.broadcast(m, pos=self.pos)
 
     def drain_inbox(self):
         if self.inbox is None:
@@ -140,11 +144,14 @@ class Robot:
         if self.bus is None:
             return
         self.bus.broadcast(Message(sender=self.rid, type="BLOCKED",
-                                   payload={"cells": [list(c) for c in cells]}))
+                                   payload={"cells": [list(c) for c in cells]}),
+                           pos=self.pos)
 
     # ---- movement decision ----
     def next_step(self):
         """Return next cell to move to, or None to wait. Handles both policies."""
+        if self.dead:
+            return None  # dry wreck: never moves again
         if self.goal is None or self.pos == self.goal:
             return None
         if not self.path:
@@ -207,6 +214,17 @@ class Robot:
                 if ppri < mine:
                     contested = True
                 # else: I win, keep going
+            # case 2b: time-window reservation — my ETA-k cell collides with
+            # a higher-priority peer's ETA-j cell (|k-j| <= 1 tick), so we
+            # would arrive together. Yield early instead of driving in.
+            if not contested and ppri < mine:
+                for k, cell in enumerate(self.path[1:4], start=2):
+                    for j, pc in enumerate(pintent[:3], start=1):
+                        if cell == pc and abs(k - j) <= 1:
+                            contested = True
+                            break
+                    if contested:
+                        break
             # case 3: head-on swap (deadlock): my next == peer pos AND peer next == my pos
             if pintent and ppos == nxt and pintent[0] == self.pos:
                 if ppri < mine:
@@ -278,7 +296,9 @@ class Robot:
             return
         self.pos = nxt
         self.path = self.path[1:]
-        self.battery = max(0.0, self.battery - DRAIN_PER_MOVE)
+        loaded = self.phase == "drop" and self.task_id is not None
+        self.battery = max(0.0, self.battery
+                           - (LOADED_DRAIN if loaded else EMPTY_DRAIN))
         self.wait_ticks = 0
 
     # ---- charging ----
@@ -320,6 +340,7 @@ class Robot:
         else:
             self.saved_task = None
         self.charging = True
+        self.dock_target = dock
         self.charge_target = min(100.0, target)
         self.task_urgency = -1  # charging trip outranks deliveries
         self.goal = dock
@@ -331,6 +352,7 @@ class Robot:
     def finish_charging(self):
         """Restore suspended task after recharge."""
         self.charging = False
+        self.dock_target = None
         if self.saved_task is not None:
             tid, p, d, ph, urg = self.saved_task
             self.task_id, self.pickup, self.drop = tid, p, d

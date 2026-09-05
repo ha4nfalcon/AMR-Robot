@@ -8,18 +8,30 @@ Ties -> lower robot id, then lower task id.
 from warehouse_sim.planner import astar
 
 def bid(robot, task):
-    """A* distance robot -> pickup (pure proximity, charge ignored)."""
+    """A* distance robot -> pickup (pure proximity, charge ignored),
+    plus a small detour-to-dock term for low robots so they win work
+    they can still escape from (0.15 x drop->nearest-dock when <50%)."""
     p1 = astar(robot.pos, task["pickup"], robot.wmap, blocked=robot.blocked_known)
     if not p1:
         return float("inf")
-    return len(p1)
+    cost = len(p1)
+    if robot.battery < 50:
+        best = float("inf")
+        for d in robot.wmap.docks:
+            p = astar(task["drop"], d, robot.wmap, blocked=robot.blocked_known)
+            if p:
+                best = min(best, len(p) - 1)
+        if best < float("inf"):
+            cost += 0.15 * best
+    return cost
 
 def auction(tasks, robots):
     """tasks: list of dicts {id, pickup, drop, urgency, assigned}.
     Greedy global nearest-pickup matching. Returns {task_id: rid}."""
     assign = {}
     free = [r for r in robots
-            if not r.charging and (r.goal is None or r.pos == r.goal)]
+            if not r.charging and not r.dead
+            and (r.goal is None or r.pos == r.goal)]
     open_tasks = [t for t in tasks if t.get("assigned") is None]
     while open_tasks and free:
         best = None  # ((cost, rid, tid), robot, task)

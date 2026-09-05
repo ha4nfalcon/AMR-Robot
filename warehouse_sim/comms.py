@@ -5,13 +5,17 @@ locally (edge). Two transports are provided:
 
 1. LocalBus (in-process pub/sub) — used for single-machine simulation.
    API-identical to a network bus: robots only call broadcast()/inbox.
+   Models a REAL radio channel: per-message loss, fixed delivery delay,
+   and dead zones (rects where radios go deaf). Metrics: .dropped.
 2. UdpPeer (real socket broadcast) — drop-in for Raspberry Pi / Jetson Nano.
    Run one instance per robot (even across Pis on same LAN) and messages
-   propagate without any server. JSON-encoded, <1KB, 5-10 Hz.
+   propagate without any server. JSON-encoded, <1KB, 5-10 Hz. On hardware,
+   loss/delay/dead-zones are LAN properties, not simulated.
 
 Message types: STATE (pos/intent), TASK_BID, TASK_ASSIGN, BLOCKED, HEARTBEAT.
 """
 import json
+import random
 import socket
 import threading
 import time
@@ -28,20 +32,69 @@ class Message:
 
 
 class LocalBus:
-    """In-process P2P bus simulating local broadcast (no central node)."""
-    def __init__(self):
+    """In-process P2P bus simulating a real radio channel (no central node).
+
+    drop_rate: per-receiver loss probability. delay_ticks: delivery lag.
+    dead_zones: [(x0,y0,x1,y1), ...] — senders inside cannot transmit;
+    receivers inside hold messages until they drive out (TTL, then drop).
+    """
+    HOLD_TTL = 10
+
+    def __init__(self, drop_rate=0.0, delay_ticks=0, dead_zones=(), seed=None):
         self._subs: dict[int, queue.Queue] = {}
+        self.drop_rate = drop_rate
+        self.delay_ticks = delay_ticks
+        self.dead_zones = [tuple(z) for z in dead_zones]
+        self._pending: list = []  # [deliver_tick, rid, msg, holds]
+        self._now = 0
+        self._rng = random.Random(seed)
+        self.dropped = 0  # lost-message counter (dashboard honesty metric)
 
     def register(self, robot_id: int) -> queue.Queue:
         q: queue.Queue = queue.Queue()
         self._subs[robot_id] = q
         return q
 
-    def broadcast(self, msg: Message):
-        # peer-to-peer fan-out: every robot except sender gets a copy
+    def in_dead_zone(self, pos) -> bool:
+        if pos is None:
+            return False
+        x, y = pos
+        return any(x0 <= x <= x1 and y0 <= y <= y1
+                   for x0, y0, x1, y1 in self.dead_zones)
+
+    def broadcast(self, msg: Message, pos=None):
+        # peer-to-peer fan-out: every robot except sender gets a copy,
+        # unless the sender is deaf (dead zone) or the packet is lost.
+        if self.in_dead_zone(pos):
+            self.dropped += len(self._subs) - 1
+            return
         for rid, q in self._subs.items():
             if rid != msg.sender:
-                q.put(msg)
+                if self._rng.random() < self.drop_rate:
+                    self.dropped += 1
+                    continue
+                if self.delay_ticks > 0:
+                    self._pending.append(
+                        [self._now + self.delay_ticks, rid, msg, 0])
+                else:
+                    q.put(msg)
+
+    def pump(self, tick, positions):
+        """Deliver due messages; hold those addressed into dead zones."""
+        self._now = tick
+        still = []
+        for due, rid, msg, holds in self._pending:
+            if due > tick:
+                still.append([due, rid, msg, holds])
+                continue
+            if self.in_dead_zone(positions.get(rid)):
+                if holds >= self.HOLD_TTL:
+                    self.dropped += 1
+                else:
+                    still.append([tick + 1, rid, msg, holds + 1])
+                continue
+            self._subs[rid].put(msg)
+        self._pending = still
 
     def peer_count(self) -> int:
         return len(self._subs)
