@@ -1,0 +1,3 @@
+# Edge-ready, stdlib-first. Optional plots only.
+numpy>=1.24
+matplotlib>=3.7
